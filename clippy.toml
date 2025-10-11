@@ -1,0 +1,22 @@
+# Security-focused Clippy configuration to surface high-risk patterns
+warn-on-all-wildcard-imports = true
+allow-unwrap-in-tests = false
+allow-indexing-slicing-in-tests = false
+allow-dbg-in-tests = false
+avoid-breaking-exported-api = true
+
+disallowed-methods = [
+    "core::result::Result::unwrap",
+    "core::option::Option::unwrap",
+    "core::result::Result::expect",
+    "core::option::Option::expect",
+    "alloc::vec::Vec::remove",
+    "std::process::Command::output",
+    "std::process::Command::status",
+    "std::process::Command::spawn",
+    "std::process::exit"
+]
+
+disallowed-macros = [
+    "std::dbg"
+]
