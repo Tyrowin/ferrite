@@ -46,7 +46,7 @@ impl RateLimiterState {
                     let retry_after = self
                         .window
                         .checked_sub(elapsed.min(self.window))
-                        .unwrap_or_else(|| Duration::from_secs(0));
+                        .unwrap_or(Duration::from_secs(0));
                     return Err(retry_after);
                 }
 

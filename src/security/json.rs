@@ -1,11 +1,12 @@
 use axum::{
     async_trait,
-    extract::{FromRequest, Json, Request, rejection::JsonRejection as AxumJsonRejection},
+    body::to_bytes,
+    extract::{FromRequest, Request},
     http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use serde::de::DeserializeOwned;
-use serde_json::{self, Deserializer, Value};
+use serde_json::{self, Deserializer};
 
 pub const MAX_BODY_SIZE_BYTES: usize = 64 * 1024; // 64 KiB upper bound for request bodies
 
@@ -48,16 +49,6 @@ impl JsonRejection {
 
         Self::new(StatusCode::BAD_REQUEST, message)
     }
-
-    fn from_axum(rejection: AxumJsonRejection) -> Self {
-        let status = rejection.status();
-        let mut message = rejection.to_string();
-        if message.len() > 512 {
-            message.truncate(512);
-        }
-
-        Self::new(status, message)
-    }
 }
 
 #[derive(serde::Serialize)]
@@ -84,31 +75,22 @@ where
 
     async fn from_request(
         req: Request<axum::body::Body>,
-        state: &S,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let (parts, body) = req.into_parts();
         validate_content_type(&parts.headers)?;
 
         let req = Request::from_parts(parts, body);
-        let Json(raw_value) = Json::<Value>::from_request(req, state)
+        let body_bytes = to_bytes(req.into_body(), MAX_BODY_SIZE_BYTES)
             .await
-            .map_err(JsonRejection::from_axum)?;
+            .map_err(|err| {
+                JsonRejection::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {err}"),
+                )
+            })?;
 
-        let serialized = serde_json::to_vec(&raw_value).map_err(|err| {
-            JsonRejection::new(
-                StatusCode::BAD_REQUEST,
-                format!("failed to process JSON payload: {err}"),
-            )
-        })?;
-
-        if serialized.len() > MAX_BODY_SIZE_BYTES {
-            return Err(JsonRejection::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("request payload exceeds {MAX_BODY_SIZE_BYTES} bytes"),
-            ));
-        }
-
-        let mut deserializer = Deserializer::from_slice(&serialized);
+        let mut deserializer = Deserializer::from_slice(body_bytes.as_ref());
         let result = serde_path_to_error::deserialize(&mut deserializer)
             .map_err(JsonRejection::parsing_error)?;
 
