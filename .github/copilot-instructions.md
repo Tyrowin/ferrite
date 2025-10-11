@@ -10,7 +10,7 @@ Ferrite is a fast, type-safe backend service built with Rust, Axum, and Diesel. 
 - **Focus**: Type safety, performance, and security
 
 ## Coding Standards
-- Follow the official [Rust Style Guide](https://doc.rust-lang.org/nightly/style-guide/)
+- Follow the official Rust Style Guide (`https://doc.rust-lang.org/nightly/style-guide/`)
 - Use `rustfmt` for code formatting
 - Use `clippy` for linting and catching common mistakes
 - Prefer idiomatic Rust patterns and practices
