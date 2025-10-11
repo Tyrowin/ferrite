@@ -13,7 +13,6 @@ use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel_async::RunQueryDsl;
-use dotenvy::dotenv;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -229,13 +228,10 @@ fn decode_token(token: &str) -> Result<Claims, AuthRouteError> {
 }
 
 fn jwt_secret() -> Result<&'static String, AuthRouteError> {
-    if let Some(secret) = JWT_SECRET.get() {
-        return Ok(secret);
-    }
-
-    dotenv().ok();
-    let value = std::env::var("JWT_SECRET").map_err(|_| AuthRouteError::MissingJwtSecret)?;
-    Ok(JWT_SECRET.get_or_init(|| value))
+    JWT_SECRET.get().map(Ok).unwrap_or_else(|| {
+        let value = std::env::var("JWT_SECRET").map_err(|_| AuthRouteError::MissingJwtSecret)?;
+        Ok(JWT_SECRET.get_or_init(|| value))
+    })
 }
 
 fn map_diesel_error(error: DieselError) -> AuthRouteError {
