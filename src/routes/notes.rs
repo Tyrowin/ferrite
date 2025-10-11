@@ -130,10 +130,10 @@ pub async fn update_note(
     Path(note_id): Path<Uuid>,
     ValidatedJson(payload): ValidatedJson<NotePayload>,
 ) -> Result<Json<Note>, NotesError> {
-    let validator = payload.into_new_note(user_id)?;
+    let validated_note = payload.into_new_note(user_id)?;
 
-    let validated_title = validator.title;
-    let validated_body = validator.body;
+    let validated_title = validated_note.title;
+    let validated_body = validated_note.body;
     let current_time = Utc::now();
 
     let mut conn = pool
