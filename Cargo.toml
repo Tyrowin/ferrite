@@ -7,6 +7,7 @@ edition = "2024"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -15,7 +16,10 @@ anyhow = "1.0"
 argon2 = "0.5"
 jsonwebtoken = "9"
 diesel = { version = "2.2.3", features = ["postgres", "r2d2", "chrono", "uuid"] }
-"diesel-async" = { version = "0.7.3", features = ["postgres", "tokio-postgres"] }
+"diesel-async" = { version = "0.7.3", features = ["postgres", "tokio-postgres", "bb8"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+dashmap = "5"
+serde_path_to_error = "0.1"
+tower-http = { version = "0.5", features = ["set-header"] }

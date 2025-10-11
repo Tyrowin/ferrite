@@ -87,7 +87,7 @@ where
 
 fn ensure_valid_username(value: &str) -> ValidationResult<()> {
     let len = value.chars().count();
-    let is_ascii = value.chars().all(|c| c.is_ascii());
+    let is_ascii = value.is_ascii();
     if !(3..=32).contains(&len) || !is_ascii {
         return Err(ModelValidationError::InvalidUsername);
     }
@@ -101,17 +101,19 @@ fn ensure_valid_username(value: &str) -> ValidationResult<()> {
     Ok(())
 }
 
-fn ensure_valid_email(value: &str) -> ValidationResult<()> {
+pub(crate) fn ensure_valid_email(value: &str) -> ValidationResult<()> {
     let len = value.len();
-    if len < 3 || len > 255 {
+    if !(3..=255).contains(&len) {
         return Err(ModelValidationError::InvalidEmail);
     }
 
     let mut parts = value.split('@');
-    let (local, domain) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(local), Some(domain), None) => (local, domain),
-        _ => return Err(ModelValidationError::InvalidEmail),
+    let (Some(local), Some(domain)) = (parts.next(), parts.next()) else {
+        return Err(ModelValidationError::InvalidEmail);
     };
+    if parts.next().is_some() {
+        return Err(ModelValidationError::InvalidEmail);
+    }
 
     if local.is_empty() || domain.len() < 3 || !domain.contains('.') {
         return Err(ModelValidationError::InvalidEmail);
