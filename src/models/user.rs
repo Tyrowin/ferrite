@@ -1,10 +1,6 @@
-use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use rand_core::OsRng;
-use serde::Deserialize;
 use serde::Serialize;
-use serde::de::{self, Deserializer};
 use uuid::Uuid;
 
 use crate::schema::users;
@@ -23,14 +19,11 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Insertable, Deserialize)]
+#[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = users)]
 pub struct NewUser {
-    #[serde(deserialize_with = "deserialize_username")]
     pub username: String,
-    #[serde(deserialize_with = "deserialize_email")]
     pub email: String,
-    #[serde(rename = "password", deserialize_with = "deserialize_password")]
     pub password_hash: String,
 }
 
@@ -47,45 +40,7 @@ impl NewUser {
     }
 }
 
-fn deserialize_username<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    let trimmed = value.trim().to_string();
-    if trimmed.is_empty() {
-        return Err(de::Error::custom("username must not be empty"));
-    }
-    Ok(trimmed)
-}
-
-fn deserialize_email<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    let normalized = value.trim().to_lowercase();
-    if normalized.is_empty() {
-        return Err(de::Error::custom("email must not be empty"));
-    }
-    Ok(normalized)
-}
-
-fn deserialize_password<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let plain = String::deserialize(deserializer)?;
-    ensure_valid_password(&plain).map_err(de::Error::custom)?;
-
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(plain.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|err| de::Error::custom(err.to_string()))
-}
-
-fn ensure_valid_username(value: &str) -> ValidationResult<()> {
+pub(crate) fn ensure_valid_username(value: &str) -> ValidationResult<()> {
     let len = value.chars().count();
     let is_ascii = value.is_ascii();
     if !(3..=32).contains(&len) || !is_ascii {
@@ -130,7 +85,7 @@ pub(crate) fn ensure_valid_email(value: &str) -> ValidationResult<()> {
     Ok(())
 }
 
-fn ensure_valid_password(password: &str) -> ValidationResult<()> {
+pub(crate) fn ensure_valid_password(password: &str) -> ValidationResult<()> {
     if password.len() < 12 {
         return Err(ModelValidationError::WeakPassword);
     }
