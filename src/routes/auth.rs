@@ -1,26 +1,25 @@
-use std::{num::NonZeroU32, sync::OnceLock, time::Duration};
+use std::{num::NonZeroU32, time::Duration};
 
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use axum::http::StatusCode;
 use axum::{
-    Extension, Json, Router, async_trait,
-    extract::FromRequestParts,
-    http::{StatusCode, header::AUTHORIZATION, request::Parts},
-    middleware,
+    Extension, Json, Router, middleware,
     response::{IntoResponse, Response},
     routing::post,
 };
-use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel_async::RunQueryDsl;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::db::PgPool;
-use crate::models::user::{NewUser, User, ensure_valid_email};
+use crate::models::user::{
+    NewUser, User, ensure_valid_email, ensure_valid_password, ensure_valid_username,
+};
 use crate::schema::users::dsl::{email as users_email, users};
+use crate::security::auth::{JwtAuthError, issue_token};
 use crate::security::json::ValidatedJson;
 use crate::security::rate_limit::{RateLimiterState, enforce_rate_limit};
 
@@ -46,6 +45,28 @@ pub fn router() -> Router {
                 enforce_rate_limit,
             )),
         )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterRequest {
+    username: String,
+    email: String,
+    password: String,
+}
+
+impl RegisterRequest {
+    fn validate(&mut self) -> Result<(), String> {
+        self.username = self.username.trim().to_string();
+        ensure_valid_username(&self.username).map_err(|err| err.to_string())?;
+
+        self.email = self.email.trim().to_lowercase();
+        ensure_valid_email(&self.email).map_err(|err| err.to_string())?;
+
+        ensure_valid_password(&self.password).map_err(|err| err.to_string())?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,48 +116,69 @@ pub enum AuthRouteError {
     Pool(String),
     #[error("invalid email or password")]
     InvalidCredentials,
-    #[error("authorization header is missing")]
-    MissingAuthHeader,
-    #[error("authorization header is malformed")]
-    InvalidAuthHeader,
-    #[error("invalid or expired token")]
-    InvalidToken,
-    #[error("JWT_SECRET environment variable is not set")]
-    MissingJwtSecret,
-    #[error("failed to encode authentication token: {0}")]
-    TokenEncoding(String),
+    #[error("failed to hash password: {0}")]
+    PasswordHashing(String),
+    #[error(transparent)]
+    Jwt(#[from] JwtAuthError),
 }
 
 impl IntoResponse for AuthRouteError {
     fn into_response(self) -> Response {
-        let status = match self {
-            AuthRouteError::Validation(_) => StatusCode::BAD_REQUEST,
-            AuthRouteError::Conflict(_) => StatusCode::CONFLICT,
-            AuthRouteError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AuthRouteError::Pool(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AuthRouteError::InvalidCredentials => StatusCode::UNAUTHORIZED,
-            AuthRouteError::MissingAuthHeader | AuthRouteError::InvalidAuthHeader => {
-                StatusCode::UNAUTHORIZED
+        match self {
+            AuthRouteError::Jwt(err) => err.into_response(),
+            AuthRouteError::Validation(message) => error_response(StatusCode::BAD_REQUEST, message),
+            AuthRouteError::Conflict(message) => error_response(StatusCode::CONFLICT, message),
+            AuthRouteError::Database(message) => {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, message)
             }
-            AuthRouteError::InvalidToken => StatusCode::UNAUTHORIZED,
-            AuthRouteError::MissingJwtSecret | AuthRouteError::TokenEncoding(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
+            AuthRouteError::Pool(message) => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, message)
             }
-        };
-
-        let body = Json(ErrorResponse {
-            error: self.to_string(),
-        });
-
-        (status, body).into_response()
+            AuthRouteError::InvalidCredentials => error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid email or password".to_string(),
+            ),
+            AuthRouteError::PasswordHashing(message) => {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        }
     }
+}
+
+fn error_response(status: StatusCode, message: String) -> Response {
+    let body = Json(ErrorResponse { error: message });
+    (status, body).into_response()
 }
 
 pub async fn register(
     Extension(pool): Extension<PgPool>,
-    ValidatedJson(mut payload): ValidatedJson<NewUser>,
+    ValidatedJson(mut payload): ValidatedJson<RegisterRequest>,
 ) -> Result<impl IntoResponse, AuthRouteError> {
     payload
+        .validate()
+        .map_err(|err| AuthRouteError::Validation(err.to_string()))?;
+
+    let RegisterRequest {
+        username,
+        email,
+        password,
+    } = payload;
+
+    let password_hash = {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|err| AuthRouteError::PasswordHashing(err.to_string()))?
+            .to_string()
+    };
+
+    let mut new_user = NewUser {
+        username,
+        email,
+        password_hash,
+    };
+
+    new_user
         .validate()
         .map_err(|err| AuthRouteError::Validation(err.to_string()))?;
 
@@ -146,7 +188,7 @@ pub async fn register(
         .map_err(|err| AuthRouteError::Pool(err.to_string()))?;
 
     let user: User = diesel::insert_into(users)
-        .values(&payload)
+        .values(&new_user)
         .get_result(&mut conn)
         .await
         .map_err(map_diesel_error)?;
@@ -190,50 +232,6 @@ pub async fn login(
     Ok((StatusCode::OK, Json(AuthResponse { token, user })))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: Uuid,
-    exp: usize,
-    iat: usize,
-}
-
-static JWT_SECRET: OnceLock<String> = OnceLock::new();
-
-fn issue_token(user_id: Uuid) -> Result<String, AuthRouteError> {
-    let secret = jwt_secret()?;
-    let now = Utc::now();
-    let expires_at = now + ChronoDuration::hours(24);
-
-    let claims = Claims {
-        sub: user_id,
-        iat: now.timestamp() as usize,
-        exp: expires_at.timestamp() as usize,
-    };
-
-    let encoding_key = EncodingKey::from_secret(secret.as_bytes());
-
-    encode(&Header::new(Algorithm::HS256), &claims, &encoding_key)
-        .map_err(|err| AuthRouteError::TokenEncoding(err.to_string()))
-}
-
-fn decode_token(token: &str) -> Result<Claims, AuthRouteError> {
-    let secret = jwt_secret()?;
-    let decoding_key = DecodingKey::from_secret(secret.as_bytes());
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-
-    decode::<Claims>(token, &decoding_key, &validation)
-        .map(|data| data.claims)
-        .map_err(|_| AuthRouteError::InvalidToken)
-}
-
-fn jwt_secret() -> Result<&'static String, AuthRouteError> {
-    JWT_SECRET.get().map(Ok).unwrap_or_else(|| {
-        let value = std::env::var("JWT_SECRET").map_err(|_| AuthRouteError::MissingJwtSecret)?;
-        Ok(JWT_SECRET.get_or_init(|| value))
-    })
-}
-
 fn map_diesel_error(error: DieselError) -> AuthRouteError {
     match error {
         DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, info) => {
@@ -241,35 +239,5 @@ fn map_diesel_error(error: DieselError) -> AuthRouteError {
             AuthRouteError::Conflict(format!("duplicate value violates {}", constraint))
         }
         other => AuthRouteError::Database(other.to_string()),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AuthenticatedUser(pub Uuid);
-
-#[async_trait]
-impl<S> FromRequestParts<S> for AuthenticatedUser
-where
-    S: Send + Sync,
-{
-    type Rejection = AuthRouteError;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let header_value = parts
-            .headers
-            .get(AUTHORIZATION)
-            .ok_or(AuthRouteError::MissingAuthHeader)?;
-
-        let header_str = header_value
-            .to_str()
-            .map_err(|_| AuthRouteError::InvalidAuthHeader)?;
-
-        let token = header_str
-            .strip_prefix("Bearer ")
-            .ok_or(AuthRouteError::InvalidAuthHeader)?;
-
-        let claims = decode_token(token)?;
-
-        Ok(AuthenticatedUser(claims.sub))
     }
 }
