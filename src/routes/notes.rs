@@ -2,6 +2,7 @@ use axum::{
     Extension, Json, Router,
     extract::Path,
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, put},
 };
@@ -15,17 +16,18 @@ use uuid::Uuid;
 
 use crate::db::PgPool;
 use crate::models::note::{NewNote, Note};
-use crate::routes::auth::AuthenticatedUser;
 use crate::schema::notes::dsl::{
     body as notes_body, created_at as notes_created_at, id as notes_id, notes as notes_table,
     title as notes_title, updated_at as notes_updated_at, user_id as notes_user_id,
 };
+use crate::security::auth::{AuthenticatedUser, authenticate};
 use crate::security::json::ValidatedJson;
 
 pub fn router() -> Router {
     Router::new()
         .route("/notes", get(list_notes).post(create_note))
         .route("/notes/:id", put(update_note).delete(delete_note))
+        .layer(middleware::from_fn(authenticate))
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +63,8 @@ pub enum NotesError {
     Validation(String),
     #[error("note not found")]
     NotFound,
+    #[error("forbidden: you do not have access to this note")]
+    Forbidden,
     #[error("database error: {0}")]
     Database(String),
     #[error("connection pool error: {0}")]
@@ -72,6 +76,7 @@ impl IntoResponse for NotesError {
         let status = match self {
             NotesError::Validation(_) => StatusCode::BAD_REQUEST,
             NotesError::NotFound => StatusCode::NOT_FOUND,
+            NotesError::Forbidden => StatusCode::FORBIDDEN,
             NotesError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             NotesError::Pool(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
@@ -141,6 +146,19 @@ pub async fn update_note(
         .await
         .map_err(|err| NotesError::Pool(err.to_string()))?;
 
+    let existing: Note = notes_table
+        .filter(notes_id.eq(note_id))
+        .first(&mut conn)
+        .await
+        .map_err(|err| match err {
+            DieselError::NotFound => NotesError::NotFound,
+            other => NotesError::Database(other.to_string()),
+        })?;
+
+    if existing.user_id != user_id {
+        return Err(NotesError::Forbidden);
+    }
+
     let note =
         diesel::update(notes_table.filter(notes_id.eq(note_id).and(notes_user_id.eq(user_id))))
             .set((
@@ -167,6 +185,19 @@ pub async fn delete_note(
         .get()
         .await
         .map_err(|err| NotesError::Pool(err.to_string()))?;
+
+    let existing: Note = notes_table
+        .filter(notes_id.eq(note_id))
+        .first(&mut conn)
+        .await
+        .map_err(|err| match err {
+            DieselError::NotFound => NotesError::NotFound,
+            other => NotesError::Database(other.to_string()),
+        })?;
+
+    if existing.user_id != user_id {
+        return Err(NotesError::Forbidden);
+    }
 
     let affected =
         diesel::delete(notes_table.filter(notes_id.eq(note_id).and(notes_user_id.eq(user_id))))
