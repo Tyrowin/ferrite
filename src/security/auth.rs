@@ -68,6 +68,9 @@ impl IntoResponse for JwtAuthError {
 
 static JWT_SECRET: OnceLock<String> = OnceLock::new();
 
+const MIN_JWT_SECRET_LENGTH: usize = 32;
+const MIN_JWT_SECRET_UNIQUE_CHARS: usize = 8;
+
 pub async fn authenticate(
     mut request: Request<axum::body::Body>,
     next: Next,
@@ -134,12 +137,13 @@ fn jwt_secret() -> Result<&'static String, JwtAuthError> {
 
 fn ensure_secret_strength(secret: &str) -> Result<(), JwtAuthError> {
     let trimmed = secret.trim();
-    if trimmed.len() < 32 {
+    if trimmed.len() < MIN_JWT_SECRET_LENGTH {
         return Err(JwtAuthError::WeakJwtSecret);
     }
 
     let unique_chars = trimmed.chars().collect::<HashSet<_>>();
-    if unique_chars.len() < 8 {
+    // Ensure the secret contains enough entropy beyond simple repetition.
+    if unique_chars.len() < MIN_JWT_SECRET_UNIQUE_CHARS {
         return Err(JwtAuthError::WeakJwtSecret);
     }
 
