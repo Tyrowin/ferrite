@@ -66,7 +66,7 @@ pub enum AppError {
 
     // Rate limiting
     #[error("rate limit exceeded; please try again later")]
-    RateLimitExceeded,
+    RateLimitExceeded { retry_after: Option<std::time::Duration> },
 
     // Request parsing errors
     #[error("invalid JSON payload: {0}")]
@@ -121,7 +121,7 @@ impl AppError {
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             AppError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            AppError::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            AppError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
 
             // 5xx Server errors
             AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -155,7 +155,7 @@ impl AppError {
                     | AppError::NotFound
                     | AppError::UnsupportedMediaType
                     | AppError::PayloadTooLarge
-                    | AppError::RateLimitExceeded
+                    | AppError::RateLimitExceeded { .. }
             )
         }
     }
@@ -259,7 +259,23 @@ impl IntoResponse for AppError {
             details,
         });
 
-        (status, body).into_response()
+        // Add Retry-After header for rate limit errors
+        match &self {
+            AppError::RateLimitExceeded { retry_after } => {
+                let retry_secs = retry_after
+                    .unwrap_or(std::time::Duration::from_secs(60))
+                    .as_secs()
+                    .max(1);
+                
+                let mut response = (status, body).into_response();
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    retry_secs.to_string().parse().unwrap(),
+                );
+                response
+            }
+            _ => (status, body).into_response(),
+        }
     }
 }
 
@@ -273,7 +289,33 @@ impl From<DieselError> for AppError {
 
 impl From<jsonwebtoken::errors::Error> for AppError {
     fn from(error: jsonwebtoken::errors::Error) -> Self {
-        AppError::TokenEncoding(error.to_string())
+        use jsonwebtoken::errors::ErrorKind;
+        
+        // Map JWT errors to appropriate AppError variants based on whether
+        // they represent client errors (invalid/expired tokens) or server errors
+        // (configuration/encoding issues)
+        match error.kind() {
+            // Client errors: invalid, expired, or malformed tokens (4xx)
+            ErrorKind::InvalidToken
+            | ErrorKind::InvalidSignature
+            | ErrorKind::ExpiredSignature
+            | ErrorKind::ImmatureSignature
+            | ErrorKind::InvalidIssuer
+            | ErrorKind::InvalidAudience
+            | ErrorKind::InvalidSubject
+            | ErrorKind::InvalidAlgorithm => AppError::InvalidToken,
+            
+            // Server errors: key configuration or encoding issues (5xx)
+            ErrorKind::InvalidRsaKey(_)
+            | ErrorKind::InvalidEcdsaKey
+            | ErrorKind::RsaFailedSigning
+            | ErrorKind::InvalidKeyFormat
+            | ErrorKind::MissingRequiredClaim(_) => AppError::TokenEncoding(error.to_string()),
+            
+            // Ambiguous cases: treat as client errors for security
+            // (don't expose internal parsing/crypto details)
+            _ => AppError::InvalidToken,
+        }
     }
 }
 
@@ -307,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_error_status() {
-        let error = AppError::RateLimitExceeded;
+        let error = AppError::RateLimitExceeded { retry_after: Some(std::time::Duration::from_secs(60)) };
         assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -326,7 +368,7 @@ mod tests {
     #[cfg(not(debug_assertions))]
     #[test]
     fn test_internal_errors_hidden_in_production() {
-        let error = AppError::Internal("sensitive internal detail".to_string());
+        let error = AppError::PasswordHashing("sensitive internal detail".to_string());
         assert!(!error.should_expose_details());
         assert!(!error.user_message().contains("sensitive internal detail"));
     }
@@ -337,4 +379,30 @@ mod tests {
         let error = AppError::Database(diesel::result::Error::NotFound);
         assert!(error.should_expose_details());
     }
+
+    #[test]
+    fn test_jwt_client_errors_return_401() {
+        use jsonwebtoken::errors::{Error as JwtError, ErrorKind};
+        
+        // Test that token validation errors are treated as client errors (401)
+        let expired_error: AppError = JwtError::from(ErrorKind::ExpiredSignature).into();
+        assert_eq!(expired_error.status_code(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(expired_error, AppError::InvalidToken));
+        
+        let invalid_sig_error: AppError = JwtError::from(ErrorKind::InvalidSignature).into();
+        assert_eq!(invalid_sig_error.status_code(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(invalid_sig_error, AppError::InvalidToken));
+    }
+
+    #[test]
+    fn test_jwt_server_errors_return_500() {
+        use jsonwebtoken::errors::{Error as JwtError, ErrorKind};
+        
+        // Test that key configuration errors are treated as server errors (500)
+        let key_error: AppError = JwtError::from(ErrorKind::InvalidEcdsaKey).into();
+        assert_eq!(key_error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(key_error, AppError::TokenEncoding(_)));
+    }
 }
+
+
