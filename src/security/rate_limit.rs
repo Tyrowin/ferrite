@@ -7,13 +7,14 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, Request, StatusCode, header::HeaderValue},
+    http::{HeaderMap, Request},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use dashmap::{DashMap, mapref::entry::Entry};
-use serde::Serialize;
-use thiserror::Error;
+
+use crate::errors::AppError;
+use crate::logging::{SanitizedIpAddr, SecurityEvent};
 
 #[derive(Clone)]
 pub struct RateLimiterState {
@@ -64,51 +65,23 @@ impl RateLimiterState {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum RateLimitError {
-    #[error("too many requests, retry later")]
-    TooManyRequests { retry_after: Option<Duration> },
-}
-
-impl IntoResponse for RateLimitError {
-    fn into_response(self) -> Response {
-        let (message, retry_after_seconds) = match self {
-            RateLimitError::TooManyRequests { retry_after } => (
-                "too many requests, retry later".to_string(),
-                retry_after.map(|duration| duration.as_secs().saturating_add(1)),
-            ),
-        };
-
-        let payload = ErrorBody { error: message };
-
-        let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(payload)).into_response();
-
-        if let Some(seconds) = retry_after_seconds
-            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
-        {
-            response
-                .headers_mut()
-                .insert(axum::http::header::RETRY_AFTER, value);
-        }
-
-        response
-    }
-}
-
 pub async fn enforce_rate_limit(
     State(state): State<RateLimiterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<axum::body::Body>,
     next: Next,
-) -> Result<Response, RateLimitError> {
+) -> Result<Response, AppError> {
     let client_ip = select_client_ip(request.headers(), addr.ip());
     let now = Instant::now();
 
-    if let Err(retry_after) = state.register(client_ip, now) {
-        let retry_after = retry_after.max(Duration::from_secs(1));
-        return Err(RateLimitError::TooManyRequests {
-            retry_after: Some(retry_after),
-        });
+    if let Err(_retry_after) = state.register(client_ip, now) {
+        crate::log_security_event!(
+            SecurityEvent::RateLimitExceeded,
+            client_ip = %SanitizedIpAddr::new(client_ip),
+            "Rate limit exceeded for client"
+        );
+
+        return Err(AppError::RateLimitExceeded);
     }
 
     Ok(next.run(request).await)
@@ -127,11 +100,6 @@ fn select_client_ip(headers: &HeaderMap, fallback: IpAddr) -> IpAddr {
         .and_then(|ip| ip.trim().parse().ok());
 
     forwarded.or(real_ip).unwrap_or(fallback)
-}
-
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
 }
 
 #[derive(Debug)]

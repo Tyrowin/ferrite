@@ -34,6 +34,7 @@ pub struct NewNote {
 impl NewNote {
     pub fn validate(&mut self) -> ValidationResult<()> {
         if self.user_id == Uuid::nil() {
+            tracing::error!("Note validation failed: user_id is nil UUID");
             return Err(ModelValidationError::InvalidUserId);
         }
 
@@ -73,10 +74,16 @@ where
 fn ensure_valid_title(value: &str) -> ValidationResult<()> {
     let len = value.chars().count();
     if len == 0 || len > 120 {
+        tracing::debug!(
+            length = len,
+            max_length = 120,
+            "Note title validation failed: invalid length"
+        );
         return Err(ModelValidationError::InvalidNoteTitle);
     }
 
     if !value.chars().all(|c| !c.is_control()) {
+        tracing::debug!("Note title validation failed: contains control characters");
         return Err(ModelValidationError::InvalidNoteTitle);
     }
 
@@ -85,6 +92,7 @@ fn ensure_valid_title(value: &str) -> ValidationResult<()> {
 
 fn ensure_valid_body(value: &str) -> ValidationResult<()> {
     if value.is_empty() {
+        tracing::debug!("Note body validation failed: body is empty");
         Err(ModelValidationError::InvalidNoteBody)
     } else {
         Ok(())
