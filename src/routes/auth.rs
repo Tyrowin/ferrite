@@ -2,24 +2,21 @@ use std::{num::NonZeroU32, time::Duration};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::http::StatusCode;
-use axum::{
-    Extension, Json, Router, middleware,
-    response::{IntoResponse, Response},
-    routing::post,
-};
+use axum::{Extension, Json, Router, middleware, response::IntoResponse, routing::post};
 use diesel::prelude::*;
-use diesel::result::{DatabaseErrorKind, Error as DieselError};
+use diesel::result::Error as DieselError;
 use diesel_async::RunQueryDsl;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::db::PgPool;
+use crate::errors::AppError;
+use crate::logging::{LoggableUuid, SanitizedEmail, SanitizedUsername, SecurityEvent};
 use crate::models::user::{
     NewUser, User, ensure_valid_email, ensure_valid_password, ensure_valid_username,
 };
 use crate::schema::users::dsl::{email as users_email, users};
-use crate::security::auth::{JwtAuthError, issue_token};
+use crate::security::auth::issue_token;
 use crate::security::json::ValidatedJson;
 use crate::security::rate_limit::{RateLimiterState, enforce_rate_limit};
 
@@ -99,145 +96,187 @@ struct AuthResponse {
     user: User,
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-#[derive(Debug, Error)]
-pub enum AuthRouteError {
-    #[error("validation error: {0}")]
-    Validation(String),
-    #[error("resource conflict: {0}")]
-    Conflict(String),
-    #[error("database error: {0}")]
-    Database(String),
-    #[error("connection pool error: {0}")]
-    Pool(String),
-    #[error("invalid email or password")]
-    InvalidCredentials,
-    #[error("failed to hash password: {0}")]
-    PasswordHashing(String),
-    #[error(transparent)]
-    Jwt(#[from] JwtAuthError),
-}
-
-impl IntoResponse for AuthRouteError {
-    fn into_response(self) -> Response {
-        match self {
-            AuthRouteError::Jwt(err) => err.into_response(),
-            AuthRouteError::Validation(message) => error_response(StatusCode::BAD_REQUEST, message),
-            AuthRouteError::Conflict(message) => error_response(StatusCode::CONFLICT, message),
-            AuthRouteError::Database(message) => {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-            AuthRouteError::Pool(message) => {
-                error_response(StatusCode::SERVICE_UNAVAILABLE, message)
-            }
-            AuthRouteError::InvalidCredentials => error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid email or password".to_string(),
-            ),
-            AuthRouteError::PasswordHashing(message) => {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-        }
-    }
-}
-
-fn error_response(status: StatusCode, message: String) -> Response {
-    let body = Json(ErrorResponse { error: message });
-    (status, body).into_response()
-}
-
+#[tracing::instrument(
+    name = "register_user",
+    skip(pool, payload),
+    fields(username, email, user_id)
+)]
 pub async fn register(
     Extension(pool): Extension<PgPool>,
     ValidatedJson(mut payload): ValidatedJson<RegisterRequest>,
-) -> Result<impl IntoResponse, AuthRouteError> {
+) -> Result<impl IntoResponse, AppError> {
     payload
         .validate()
-        .map_err(|err| AuthRouteError::Validation(err.to_string()))?;
+        .map_err(|err| AppError::Validation(err.to_string()))?;
 
-    let RegisterRequest {
-        username,
-        email,
-        password,
-    } = payload;
+    let username = payload.username.clone();
+    let email = payload.email.clone();
+
+    // Record sanitized info in the current span
+    tracing::Span::current().record(
+        "username",
+        tracing::field::display(SanitizedUsername::new(&username)),
+    );
+    tracing::Span::current().record(
+        "email",
+        tracing::field::display(SanitizedEmail::new(&email)),
+    );
+
+    tracing::debug!(
+        username = %SanitizedUsername::new(&username),
+        email = %SanitizedEmail::new(&email),
+        "Processing registration request"
+    );
 
     let password_hash = {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|err| AuthRouteError::PasswordHashing(err.to_string()))?
-            .to_string()
+        let password_string = payload.password.clone();
+        tokio::task::spawn_blocking(move || -> Result<String, AppError> {
+            let salt = SaltString::generate(&mut OsRng);
+            let argon2 = Argon2::default();
+            let hash = argon2
+                .hash_password(password_string.as_bytes(), &salt)
+                .map_err(|err| AppError::PasswordHashing(err.to_string()))?;
+            Ok(hash.to_string())
+        })
+        .await
+        .map_err(|err| AppError::Validation(err.to_string()))??
     };
 
     let mut new_user = NewUser {
-        username,
-        email,
+        username: username.clone(),
+        email: email.clone(),
         password_hash,
     };
 
     new_user
         .validate()
-        .map_err(|err| AuthRouteError::Validation(err.to_string()))?;
+        .map_err(|err| AppError::Validation(err.to_string()))?;
 
     let mut conn = pool
         .get()
         .await
-        .map_err(|err| AuthRouteError::Pool(err.to_string()))?;
+        .map_err(|err| AppError::Pool(err.to_string()))?;
 
     let user: User = diesel::insert_into(users)
         .values(&new_user)
         .get_result(&mut conn)
         .await
-        .map_err(map_diesel_error)?;
+        .map_err(|err| {
+            let app_error = AppError::from_diesel(err);
+
+            crate::log_security_event!(
+                SecurityEvent::RegistrationFailure,
+                username = %SanitizedUsername::new(&username),
+                email = %SanitizedEmail::new(&email),
+                error = %app_error,
+                "User registration failed"
+            );
+
+            app_error
+        })?;
+
+    // Record user_id in span
+    tracing::Span::current().record("user_id", tracing::field::display(LoggableUuid(user.id)));
 
     let token = issue_token(user.id)?;
+
+    crate::log_security_event!(
+        SecurityEvent::RegistrationSuccess,
+        user_id = %LoggableUuid(user.id),
+        username = %SanitizedUsername::new(&username),
+        email = %SanitizedEmail::new(&email),
+        "User registered successfully"
+    );
 
     Ok((StatusCode::CREATED, Json(AuthResponse { token, user })))
 }
 
+#[tracing::instrument(name = "login_user", skip(pool, payload), fields(email, user_id))]
 pub async fn login(
     Extension(pool): Extension<PgPool>,
     ValidatedJson(mut payload): ValidatedJson<LoginRequest>,
-) -> Result<impl IntoResponse, AuthRouteError> {
-    payload.validate().map_err(AuthRouteError::Validation)?;
+) -> Result<impl IntoResponse, AppError> {
+    payload
+        .validate()
+        .map_err(|err| AppError::Validation(err.to_string()))?;
 
     let normalized_email = payload.email.clone();
+
+    // Record sanitized email in span
+    tracing::Span::current().record(
+        "email",
+        tracing::field::display(SanitizedEmail::new(&normalized_email)),
+    );
+
+    tracing::debug!(
+        email = %SanitizedEmail::new(&normalized_email),
+        "Processing login request"
+    );
 
     let mut conn = pool
         .get()
         .await
-        .map_err(|err| AuthRouteError::Pool(err.to_string()))?;
+        .map_err(|err| AppError::Pool(err.to_string()))?;
 
     let user: User = users
         .filter(users_email.eq(&normalized_email))
         .first(&mut conn)
         .await
         .map_err(|err| match err {
-            DieselError::NotFound => AuthRouteError::InvalidCredentials,
-            other => AuthRouteError::Database(other.to_string()),
+            DieselError::NotFound => {
+                crate::log_security_event!(
+                    SecurityEvent::LoginFailure,
+                    email = %SanitizedEmail::new(&normalized_email),
+                    reason = "user_not_found",
+                    "Login failed: user not found"
+                );
+                AppError::InvalidCredentials
+            }
+            other => {
+                tracing::error!(
+                    email = %SanitizedEmail::new(&normalized_email),
+                    error = %other,
+                    "Database error during login"
+                );
+                AppError::Database(other)
+            }
         })?;
 
-    let password_hash =
-        PasswordHash::new(&user.password_hash).map_err(|_| AuthRouteError::InvalidCredentials)?;
+    // Record user_id in span
+    tracing::Span::current().record("user_id", tracing::field::display(LoggableUuid(user.id)));
+
+    let password_hash = PasswordHash::new(&user.password_hash).map_err(|_| {
+        crate::log_security_event!(
+            SecurityEvent::LoginFailure,
+            user_id = %LoggableUuid(user.id),
+            email = %SanitizedEmail::new(&normalized_email),
+            reason = "invalid_password_hash",
+            "Login failed: invalid password hash"
+        );
+        AppError::InvalidCredentials
+    })?;
 
     Argon2::default()
         .verify_password(payload.password.as_bytes(), &password_hash)
-        .map_err(|_| AuthRouteError::InvalidCredentials)?;
+        .map_err(|_| {
+            crate::log_security_event!(
+                SecurityEvent::LoginFailure,
+                user_id = %LoggableUuid(user.id),
+                email = %SanitizedEmail::new(&normalized_email),
+                reason = "incorrect_password",
+                "Login failed: incorrect password"
+            );
+            AppError::InvalidCredentials
+        })?;
 
     let token = issue_token(user.id)?;
 
-    Ok((StatusCode::OK, Json(AuthResponse { token, user })))
-}
+    crate::log_security_event!(
+        SecurityEvent::LoginSuccess,
+        user_id = %LoggableUuid(user.id),
+        email = %SanitizedEmail::new(&normalized_email),
+        "User logged in successfully"
+    );
 
-fn map_diesel_error(error: DieselError) -> AuthRouteError {
-    match error {
-        DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, info) => {
-            let constraint = info.constraint_name().unwrap_or("unique constraint");
-            AuthRouteError::Conflict(format!("duplicate value violates {}", constraint))
-        }
-        other => AuthRouteError::Database(other.to_string()),
-    }
+    Ok((StatusCode::OK, Json(AuthResponse { token, user })))
 }
