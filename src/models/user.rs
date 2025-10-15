@@ -44,6 +44,11 @@ pub(crate) fn ensure_valid_username(value: &str) -> ValidationResult<()> {
     let len = value.chars().count();
     let is_ascii = value.is_ascii();
     if !(3..=32).contains(&len) || !is_ascii {
+        tracing::debug!(
+            length = len,
+            is_ascii = is_ascii,
+            "Username validation failed: invalid length or non-ASCII characters"
+        );
         return Err(ModelValidationError::InvalidUsername);
     }
 
@@ -51,6 +56,7 @@ pub(crate) fn ensure_valid_username(value: &str) -> ValidationResult<()> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if !allowed {
+        tracing::debug!("Username validation failed: contains invalid characters");
         return Err(ModelValidationError::InvalidUsername);
     }
     Ok(())
@@ -59,18 +65,27 @@ pub(crate) fn ensure_valid_username(value: &str) -> ValidationResult<()> {
 pub(crate) fn ensure_valid_email(value: &str) -> ValidationResult<()> {
     let len = value.len();
     if !(3..=255).contains(&len) {
+        tracing::debug!(length = len, "Email validation failed: invalid length");
         return Err(ModelValidationError::InvalidEmail);
     }
 
     let mut parts = value.split('@');
     let (Some(local), Some(domain)) = (parts.next(), parts.next()) else {
+        tracing::debug!("Email validation failed: missing @ or invalid format");
         return Err(ModelValidationError::InvalidEmail);
     };
     if parts.next().is_some() {
+        tracing::debug!("Email validation failed: multiple @ symbols");
         return Err(ModelValidationError::InvalidEmail);
     }
 
     if local.is_empty() || domain.len() < 3 || !domain.contains('.') {
+        tracing::debug!(
+            local_empty = local.is_empty(),
+            domain_length = domain.len(),
+            has_dot = domain.contains('.'),
+            "Email validation failed: invalid local or domain part"
+        );
         return Err(ModelValidationError::InvalidEmail);
     }
 
@@ -79,6 +94,7 @@ pub(crate) fn ensure_valid_email(value: &str) -> ValidationResult<()> {
         .chain(domain.chars())
         .all(|c| c.is_ascii_graphic() || c == '.')
     {
+        tracing::debug!("Email validation failed: contains invalid characters");
         return Err(ModelValidationError::InvalidEmail);
     }
 
@@ -87,6 +103,10 @@ pub(crate) fn ensure_valid_email(value: &str) -> ValidationResult<()> {
 
 pub(crate) fn ensure_valid_password(password: &str) -> ValidationResult<()> {
     if password.len() < 12 {
+        tracing::debug!(
+            length = password.len(),
+            "Password validation failed: too short (minimum 12 characters)"
+        );
         return Err(ModelValidationError::WeakPassword);
     }
 
@@ -98,12 +118,20 @@ pub(crate) fn ensure_valid_password(password: &str) -> ValidationResult<()> {
     if has_upper && has_lower && has_digit && has_symbol {
         Ok(())
     } else {
+        tracing::debug!(
+            has_uppercase = has_upper,
+            has_lowercase = has_lower,
+            has_digit = has_digit,
+            has_symbol = has_symbol,
+            "Password validation failed: missing required character types"
+        );
         Err(ModelValidationError::WeakPassword)
     }
 }
 
 fn ensure_hash_present(password_hash: &str) -> ValidationResult<()> {
     if password_hash.is_empty() {
+        tracing::error!("Password hash is empty during validation");
         Err(ModelValidationError::WeakPassword)
     } else {
         Ok(())
