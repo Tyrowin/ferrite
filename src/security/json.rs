@@ -2,67 +2,48 @@ use axum::{
     async_trait,
     body::to_bytes,
     extract::{FromRequest, Request},
-    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, HeaderValue, header::CONTENT_TYPE},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{self, Deserializer};
+
+use crate::errors::AppError;
 
 pub const MAX_BODY_SIZE_BYTES: usize = 64 * 1024; // 64 KiB upper bound for request bodies
 
 #[derive(Debug)]
 pub struct ValidatedJson<T>(pub T);
 
-#[derive(Debug)]
-pub struct JsonRejection {
-    status: StatusCode,
-    message: String,
+fn invalid_content_type(value: Option<&HeaderValue>) -> AppError {
+    let received = value
+        .and_then(|val| val.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+
+    tracing::warn!(
+        content_type = %received,
+        "Invalid content type in request"
+    );
+
+    AppError::UnsupportedMediaType
 }
 
-impl JsonRejection {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
-    }
+fn parsing_error(err: serde_path_to_error::Error<serde_json::Error>) -> AppError {
+    let path = err.path().to_string();
+    let error = err.into_inner();
+    let message = if path.is_empty() {
+        format!("failed to parse JSON payload: {error}")
+    } else {
+        format!("failed to parse JSON payload at {path}: {error}")
+    };
 
-    fn invalid_content_type(value: Option<&HeaderValue>) -> Self {
-        let received = value
-            .and_then(|val| val.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "missing".to_string());
-        Self::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            format!("expected application/json payload, received {received}"),
-        )
-    }
+    tracing::warn!(
+        path = %path,
+        error = %error,
+        "JSON parsing error"
+    );
 
-    fn parsing_error(err: serde_path_to_error::Error<serde_json::Error>) -> Self {
-        let path = err.path().to_string();
-        let error = err.into_inner();
-        let message = if path.is_empty() {
-            format!("failed to parse JSON payload: {error}")
-        } else {
-            format!("failed to parse JSON payload at {path}: {error}")
-        };
-
-        Self::new(StatusCode::BAD_REQUEST, message)
-    }
-}
-
-#[derive(serde::Serialize)]
-struct ErrorBody<'a> {
-    error: &'a str,
-}
-
-impl IntoResponse for JsonRejection {
-    fn into_response(self) -> Response {
-        let payload = axum::Json(ErrorBody {
-            error: self.message.as_str(),
-        });
-        (self.status, payload).into_response()
-    }
+    AppError::InvalidJson(message)
 }
 
 #[async_trait]
@@ -71,7 +52,7 @@ where
     T: DeserializeOwned + Send,
     S: Send + Sync,
 {
-    type Rejection = JsonRejection;
+    type Rejection = AppError;
 
     async fn from_request(
         req: Request<axum::body::Body>,
@@ -84,28 +65,38 @@ where
         let body_bytes = to_bytes(req.into_body(), MAX_BODY_SIZE_BYTES)
             .await
             .map_err(|err| {
-                JsonRejection::new(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to read request body: {err}"),
-                )
+                if err.to_string().contains("length limit exceeded") {
+                    tracing::warn!(
+                        max_size = MAX_BODY_SIZE_BYTES,
+                        "Request body exceeded size limit"
+                    );
+                    AppError::PayloadTooLarge
+                } else {
+                    tracing::warn!(
+                        error = %err,
+                        max_size = MAX_BODY_SIZE_BYTES,
+                        "Failed to read request body"
+                    );
+                    AppError::InvalidJson(format!("failed to read request body: {err}"))
+                }
             })?;
 
         let mut deserializer = Deserializer::from_slice(body_bytes.as_ref());
-        let result = serde_path_to_error::deserialize(&mut deserializer)
-            .map_err(JsonRejection::parsing_error)?;
+        let result = serde_path_to_error::deserialize(&mut deserializer).map_err(parsing_error)?;
 
         deserializer.end().map_err(|err| {
-            JsonRejection::new(
-                StatusCode::BAD_REQUEST,
-                format!("unexpected trailing data: {err}"),
-            )
+            tracing::warn!(
+                error = %err,
+                "Unexpected trailing data in JSON payload"
+            );
+            AppError::InvalidJson(format!("unexpected trailing data: {err}"))
         })?;
 
         Ok(ValidatedJson(result))
     }
 }
 
-fn validate_content_type(headers: &HeaderMap) -> Result<(), JsonRejection> {
+fn validate_content_type(headers: &HeaderMap) -> Result<(), AppError> {
     let value = headers.get(CONTENT_TYPE);
 
     if let Some(value) = value
@@ -115,5 +106,5 @@ fn validate_content_type(headers: &HeaderMap) -> Result<(), JsonRejection> {
         return Ok(());
     }
 
-    Err(JsonRejection::invalid_content_type(value))
+    Err(invalid_content_type(value))
 }
