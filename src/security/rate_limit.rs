@@ -74,14 +74,16 @@ pub async fn enforce_rate_limit(
     let client_ip = select_client_ip(request.headers(), addr.ip());
     let now = Instant::now();
 
-    if let Err(_retry_after) = state.register(client_ip, now) {
+    if let Err(retry_after) = state.register(client_ip, now) {
         crate::log_security_event!(
             SecurityEvent::RateLimitExceeded,
             client_ip = %SanitizedIpAddr::new(client_ip),
             "Rate limit exceeded for client"
         );
 
-        return Err(AppError::RateLimitExceeded);
+        return Err(AppError::RateLimitExceeded { 
+            retry_after: Some(retry_after.max(Duration::from_secs(1))) 
+        });
     }
 
     Ok(next.run(request).await)
