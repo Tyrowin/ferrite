@@ -1,4 +1,4 @@
-# GitHub Copilot Instructions
+# Agent Instructions
 
 ## Project Overview
 Ferrite is a fast, type-safe backend service built with Rust, Axum, and Diesel. It provides secure APIs for notes, bookmarks, and todos.
