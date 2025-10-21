@@ -16,10 +16,11 @@ A fast, type-safe backend service built with Rust, Axum, and Diesel. Secure APIs
 - 🚀 High-performance Rust backend with Axum
 - 🔒 Type-safe database operations with Diesel
 - 🐳 Production-ready Docker setup with multi-stage builds
-- 🛡️ Security-hardened distroless runtime image
+- 🛡️ Security-hardened distroless runtime image (no default credentials!)
 - 📦 Docker Compose orchestration for local development
-- 🔐 JWT authentication
+- 🔐 JWT authentication with mandatory secret configuration
 - 📊 PostgreSQL database
+- 🔒 Environment-based configuration (no hardcoded secrets)
 
 ## Quick Start
 
@@ -48,9 +49,13 @@ A fast, type-safe backend service built with Rust, Axum, and Diesel. Secure APIs
 3. **Configure Environment**
 
    ```bash
-   # Copy and edit .env file
+   # REQUIRED: Create .env file from example
    cp .env.example .env
-   # Edit DATABASE_URL and JWT_SECRET
+
+   # Edit .env and set secure values:
+   # - DATABASE_URL with your PostgreSQL credentials
+   # - JWT_SECRET (minimum 32 characters)
+   # Generate JWT secret: openssl rand -base64 32
    ```
 
 4. **Run the Application**
@@ -59,6 +64,35 @@ A fast, type-safe backend service built with Rust, Axum, and Diesel. Secure APIs
    ```
 
 ### Quick Start with Docker Compose (Recommended)
+
+**IMPORTANT: Security Setup Required**
+
+Before running, you MUST create a `.env` file with your secure credentials:
+
+```bash
+# Copy the example environment file
+cp .env.example .env
+
+# Edit .env and set secure values for:
+# - POSTGRES_USER
+# - POSTGRES_PASSWORD
+# - JWT_SECRET (minimum 32 characters)
+# NEVER use the example values in production!
+```
+
+Generate secure secrets:
+
+```bash
+# Generate a strong JWT secret
+openssl rand -base64 32
+
+# Generate a strong password
+pwgen -s 32 1
+# Or on Windows PowerShell:
+# [System.Web.Security.Membership]::GeneratePassword(32,10)
+```
+
+Then start the services:
 
 ```bash
 # Start all services (backend + database)
@@ -132,11 +166,13 @@ docker-compose down -v
 #### Run Standalone Container
 
 ```bash
+# SECURITY: Never use these example values!
+# Set real credentials in your environment or .env file
 docker run -d \
   --name ferrite-backend \
   -p 8080:8080 \
-  -e DATABASE_URL="postgres://user:pass@host:5432/db" \
-  -e JWT_SECRET="your-secret-key-minimum-32-characters" \
+  -e DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@host:5432/${POSTGRES_DB}" \
+  -e JWT_SECRET="${JWT_SECRET}" \
   -e RUST_LOG=info \
   ferrite:latest
 ```
@@ -165,12 +201,20 @@ docker run -d \
 
 ### Environment Configuration
 
-Create `.env` file or copy from `.env.docker`:
+**SECURITY CRITICAL: All values are REQUIRED**
+
+1. Copy the example file:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and provide secure values:
 
 ```bash
-# Database
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=secure_password
+# Database - Use strong credentials
+POSTGRES_USER=your_db_username
+POSTGRES_PASSWORD=your_secure_password
 POSTGRES_DB=ferrite
 POSTGRES_PORT=5432
 
@@ -178,21 +222,38 @@ POSTGRES_PORT=5432
 APP_PORT=8080
 HOST=0.0.0.0
 PORT=8080
+
+# JWT Secret - MUST be at least 32 characters
+# Generate with: openssl rand -base64 32
 JWT_SECRET=your_secure_jwt_secret_at_least_32_characters
 
 # Logging
 RUST_LOG=info,ferrite=debug
 RUST_BACKTRACE=1
+
+# PgAdmin (only if using --profile tools)
+PGADMIN_EMAIL=admin@ferrite.local
+PGADMIN_PASSWORD=your_pgadmin_password
+PGADMIN_PORT=5050
 ```
+
+**Security Best Practices:**
+
+- ✅ Never commit `.env` files to version control
+- ✅ Use strong, randomly generated passwords
+- ✅ Generate JWT secret: `openssl rand -base64 32`
+- ✅ Rotate secrets regularly
+- ✅ Set restrictive file permissions: `chmod 600 .env`
+- ✅ Use different credentials for dev/staging/production
 
 ### Database Migrations in Docker
 
 ```bash
-# Option 1: Using diesel CLI in container
+# Option 1: Using diesel CLI in container with environment variables
 docker run --rm \
   --network ferrite_ferrite-network \
   -v $(pwd)/migrations:/migrations \
-  -e DATABASE_URL="postgres://postgres:postgres@postgres:5432/ferrite" \
+  -e DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}" \
   rust:1.83-bookworm \
   bash -c "cargo install diesel_cli --no-default-features --features postgres && diesel migration run"
 
@@ -254,6 +315,32 @@ cargo audit
 
 ## Security
 
+⚠️ **IMPORTANT: No Default Credentials**
+
+Ferrite requires explicit configuration of all security-sensitive environment variables. The application will NOT start with defaults.
+
+**Required:** See [SECURITY.md](SECURITY.md) for comprehensive security guidelines.
+
+### Quick Security Setup
+
+1. **Create environment file:**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Generate secure secrets:**
+
+   ```bash
+   # JWT Secret (minimum 32 characters)
+   openssl rand -base64 32
+
+   # Strong password
+   pwgen -s 32 1
+   ```
+
+3. **Edit `.env` with your secrets** (NEVER commit this file!)
+
 ### Security Tooling
 
 **Dependency Auditing**
@@ -270,14 +357,18 @@ cargo audit
 
 ### Production Security Checklist
 
-- [ ] Generate strong JWT_SECRET (32+ characters)
-- [ ] Use secure database passwords
-- [ ] Never commit `.env` files
-- [ ] Keep base images updated
+- [ ] Generate strong, unique JWT_SECRET (32+ characters)
+- [ ] Use secure database passwords (16+ characters)
+- [ ] Never commit `.env` files to version control
+- [ ] Keep base images updated regularly
 - [ ] Run security scans: `docker scan ferrite:latest`
 - [ ] Enable HTTPS/TLS in production
-- [ ] Configure rate limiting
-- [ ] Set up monitoring and alerts
+- [ ] Configure rate limiting at reverse proxy
+- [ ] Set up monitoring and security alerts
+- [ ] Use Docker secrets or vault in production
+- [ ] Rotate credentials regularly
+
+For detailed security practices, see [SECURITY.md](SECURITY.md).
 
 ## Testing
 
