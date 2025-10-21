@@ -1,16 +1,99 @@
+version: '3.8'
+
 services:
+  # PostgreSQL Database
   postgres:
-    image: postgres
+    image: postgres:16-alpine
     container_name: ferrite-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ferrite
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ferrite}
+      # Performance tuning
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ferrite-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  # Ferrite Backend Service
+  ferrite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrite-backend
+    restart: unless-stopped
+    environment:
+      # Database configuration
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ferrite}
+      
+      # JWT Secret (should be set in .env file)
+      JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production_minimum_32_characters_required}
+      
+      # Server configuration
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8080}
+      
+      # Rust configuration
+      RUST_LOG: ${RUST_LOG:-info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ferrite-network
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/8080' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    security_opt:
+      - no-new-privileges:true
+    # Read-only root filesystem for security (uncomment if app supports it)
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
+
+  # Optional: Database Administration Tool (PgAdmin)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: ferrite-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@ferrite.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      - postgres
+    networks:
+      - ferrite-network
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    profiles:
+      - tools  # Only start when explicitly requested: docker-compose --profile tools up
+
+networks:
+  ferrite-network:
+    driver: bridge
 
 volumes:
   postgres_data:
+    driver: local
+  pgadmin_data:
+    driver: local

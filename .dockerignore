@@ -1,0 +1,51 @@
+# Git files
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+LICENSE
+AGENTS.md
+*.md
+
+# Environment files (security)
+.env
+.env.*
+
+# Build artifacts
+target/
+**/target/
+**/*.rs.bk
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test files
+tests/
+**/tests/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Docker files (no need to copy into build)
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
