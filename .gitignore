@@ -5,8 +5,10 @@ debug/
 /target
 
 # Environment secrets
+# NEVER commit actual .env files with credentials!
 .env
 .env.*
+!.env.example
 
 # IDE settings
 .vscode/
